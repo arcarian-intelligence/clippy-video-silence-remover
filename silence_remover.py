@@ -16,7 +16,7 @@ from pydub.utils import db_to_float
 _SNAP_WINDOW_MS = 10
 _SNAP_STEP_MS = 5
 _SNAP_SEARCH_MS = 300
-_ONSET_OFFSET_DB = 6
+_PEAK_FRACTION = 0.25
 _MIN_SEGMENT_MS = 33
 
 
@@ -25,21 +25,39 @@ def _snap_segment_start(
 ) -> int:
     """Walk forward from start_ms with a tight RMS window to find true speech onset.
 
-    Pydub's detect_nonsilent uses a 250ms RMS window, which can't separate a
-    faint pre-speech sound (breath, click) from real speech if both fall in the
-    same window — the segment start gets dragged back to include the dead air.
-    This snap re-scans the head of each segment with a 10ms window at a stricter
-    threshold to find where speech actually starts.
+    Pydub's detect_nonsilent considers anything above silence_thresh non-silent,
+    which catches breath, lip clicks, and ambient noise as part of a "speech"
+    segment — leaving pre-speech sound at the head of each clip.
+
+    Scan the first 300ms with a 10ms window, find the peak RMS (real speech),
+    and snap to the first window that exceeds _PEAK_FRACTION of peak. This
+    adapts per-segment: loud speech raises the bar, soft speech lowers it.
+    Floor the threshold at silence_thresh so we never return a position inside
+    true silence.
     """
     search_end = min(start_ms + _SNAP_SEARCH_MS, end_ms)
-    onset_thresh = (
-        db_to_float(silence_thresh + _ONSET_OFFSET_DB) * audio.max_possible_amplitude
+    silence_floor = (
+        db_to_float(silence_thresh) * audio.max_possible_amplitude
     )
+
+    rms_values: list[tuple[int, float]] = []
+    peak_rms = 0.0
     pos = start_ms
     while pos + _SNAP_WINDOW_MS <= search_end:
-        if audio[pos : pos + _SNAP_WINDOW_MS].rms >= onset_thresh:
-            return pos
+        rms = audio[pos : pos + _SNAP_WINDOW_MS].rms
+        rms_values.append((pos, rms))
+        if rms > peak_rms:
+            peak_rms = rms
         pos += _SNAP_STEP_MS
+
+    if not rms_values:
+        return start_ms
+
+    onset_thresh = max(peak_rms * _PEAK_FRACTION, silence_floor)
+    for window_pos, rms in rms_values:
+        if rms >= onset_thresh:
+            return window_pos
+
     return start_ms
 
 
