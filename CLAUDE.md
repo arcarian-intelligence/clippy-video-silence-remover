@@ -32,7 +32,8 @@ cd web && npm install && cd ..
 - Video processing is async — frontend polls `/api/status/:id` every 2 seconds
 - Hardware-accelerated encoding: VideoToolbox (Mac), NVENC (NVIDIA), libx264 fallback
 - `start.sh` strips sensitive env vars (Notion, Supabase, Vercel tokens, etc.) from child processes via `env -u` — prevents token leakage in `ps` output
-- Silence detection has TWO stages in `silence_remover.py`: (1) pydub's `detect_nonsilent` finds rough segment boundaries, (2) `_snap_segment_start` re-scans each segment's head with a tighter 10ms RMS window to find true speech onset. Pydub's 250ms RMS window can't separate breath/clicks from speech if both fall in the same window — the snap fixes that. Padding (start/end) is applied to the snapped onset, not pydub's raw boundary.
+- Silence detection has three stages in `silence_remover.py`, all applied to pydub's raw output: (1) `_snap_segment_start` walks the first 300ms with 25ms windows using a rise detector (next window ≥ 2× current) to reject pre-speech breath/click; (2) `_snap_segment_end` walks forward up to 400ms recovering fricative tails and vowel decays that pydub's 250ms window mistakes for silence; (3) `_merge_close_segments` re-joins phrases pydub split on a quiet middle syllable. Padding is applied after all three.
+- The FFmpeg cut path quantizes all cut times to source frame rate (CEIL via `_quantize_to_frame`) BEFORE passing to `-force_key_frames` and before each `-ss X -c copy` cut. Without this, encoders round forced KFs to the nearest video frame and `-ss` snaps backward to a previous regular KF, producing 100-400ms of leading content + mid-syllable end cuts. See `feedback_video_encoding.md` for the why.
 
 ## Known Gotchas
 
