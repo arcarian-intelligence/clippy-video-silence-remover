@@ -2,6 +2,7 @@
 """Remove silence from video files using FFmpeg and pydub."""
 
 import argparse
+import math
 import shutil
 import subprocess
 import sys
@@ -13,52 +14,154 @@ from pydub.silence import detect_nonsilent
 from pydub.utils import db_to_float
 
 
-_SNAP_WINDOW_MS = 10
-_SNAP_STEP_MS = 5
-_SNAP_SEARCH_MS = 300
-_PEAK_FRACTION = 0.25
+_SCAN_WINDOW_MS = 25
+_SCAN_STEP_MS = 5
+_ONSET_SEARCH_MS = 300
+_OFFSET_SEARCH_MS = 400
+_ONSET_RISE_RATIO = 2.0
+_ONSET_FALLBACK_PEAK_FRACTION = 0.25
+_TAIL_PEAK_FRACTION = 0.10
+_TAIL_FLOOR_DB_OFFSET = -5
+_OFFSET_STOP_AFTER_SILENT_MS = 100
+_PHRASE_MERGE_GAP_MS = 350
+_PHRASE_MERGE_FLOOR_FRACTION = 0.5
 _MIN_SEGMENT_MS = 33
+
+
+def _scan_rms(
+    audio: AudioSegment, start_ms: int, end_ms: int,
+) -> list[tuple[int, float]]:
+    """Return [(window_start_ms, rms_amplitude), ...] for windows of _SCAN_WINDOW_MS."""
+    out: list[tuple[int, float]] = []
+    pos = start_ms
+    while pos + _SCAN_WINDOW_MS <= end_ms:
+        out.append((pos, audio[pos : pos + _SCAN_WINDOW_MS].rms))
+        pos += _SCAN_STEP_MS
+    return out
 
 
 def _snap_segment_start(
     audio: AudioSegment, start_ms: int, end_ms: int, silence_thresh: int
 ) -> int:
-    """Walk forward from start_ms with a tight RMS window to find true speech onset.
+    """Find the true speech onset using rise detection.
 
-    Pydub's detect_nonsilent considers anything above silence_thresh non-silent,
-    which catches breath, lip clicks, and ambient noise as part of a "speech"
-    segment — leaving pre-speech sound at the head of each clip.
-
-    Scan the first 300ms with a 10ms window, find the peak RMS (real speech),
-    and snap to the first window that exceeds _PEAK_FRACTION of peak. This
-    adapts per-segment: loud speech raises the bar, soft speech lowers it.
-    Floor the threshold at silence_thresh so we never return a position inside
-    true silence.
+    Pydub's detect_nonsilent can include 50-200ms of breath, lip clicks, or
+    ambient noise before real speech — anything above silence_thresh counts as
+    non-silent in its 250ms window. Walk the first 300ms of the segment with
+    25ms windows and find the position where energy *jumps* (next window ≥ 2×
+    current). That signature distinguishes voiced speech onset from constant
+    pre-speech noise. Fallback to peak-fraction snap if no rise is found
+    (segment was already mid-speech).
     """
-    search_end = min(start_ms + _SNAP_SEARCH_MS, end_ms)
-    silence_floor = (
-        db_to_float(silence_thresh) * audio.max_possible_amplitude
-    )
-
-    rms_values: list[tuple[int, float]] = []
-    peak_rms = 0.0
-    pos = start_ms
-    while pos + _SNAP_WINDOW_MS <= search_end:
-        rms = audio[pos : pos + _SNAP_WINDOW_MS].rms
-        rms_values.append((pos, rms))
-        if rms > peak_rms:
-            peak_rms = rms
-        pos += _SNAP_STEP_MS
-
-    if not rms_values:
+    search_end = min(start_ms + _ONSET_SEARCH_MS, end_ms)
+    silence_floor = db_to_float(silence_thresh) * audio.max_possible_amplitude
+    rms_seq = _scan_rms(audio, start_ms, search_end)
+    if len(rms_seq) < 2:
         return start_ms
 
-    onset_thresh = max(peak_rms * _PEAK_FRACTION, silence_floor)
-    for window_pos, rms in rms_values:
-        if rms >= onset_thresh:
-            return window_pos
+    peak = max(r for _, r in rms_seq)
+    source_floor = max(silence_floor, peak * 0.05)
 
+    best_rise_pos: int | None = None
+    best_rise_score = 0.0
+    for i in range(len(rms_seq) - 1):
+        _, src_rms = rms_seq[i]
+        dst_pos, dst_rms = rms_seq[i + 1]
+        if dst_rms < silence_floor:
+            continue
+        ratio = dst_rms / max(src_rms, source_floor)
+        if ratio >= _ONSET_RISE_RATIO and ratio > best_rise_score:
+            best_rise_score = ratio
+            best_rise_pos = dst_pos
+
+    if best_rise_pos is not None:
+        return best_rise_pos
+
+    onset_thresh = max(peak * _ONSET_FALLBACK_PEAK_FRACTION, silence_floor)
+    for pos, rms in rms_seq:
+        if rms >= onset_thresh:
+            return pos
     return start_ms
+
+
+def _snap_segment_end(
+    audio: AudioSegment, start_ms: int, end_ms: int, silence_thresh: int
+) -> int:
+    """Walk forward from pydub's end recovering trailing speech energy.
+
+    Fricative tails (s, f, th), vowel decays, and consonant releases routinely
+    fall 5-10 dB below pydub's silence threshold while still being audible
+    speech. Pydub's 250ms RMS window declares silence as soon as the average
+    dips below threshold, cutting mid-syllable. Walk forward up to 400ms with
+    25ms windows, keep extending while RMS stays above the lenient tail floor
+    (max(10% of segment peak, silence_thresh - 5 dB)). Stop once we've seen
+    100ms of below-tail silence after the last audible frame.
+    """
+    duration_ms = len(audio)
+    extend_end = min(end_ms + _OFFSET_SEARCH_MS, duration_ms)
+    tail_lenient = (
+        db_to_float(silence_thresh + _TAIL_FLOOR_DB_OFFSET)
+        * audio.max_possible_amplitude
+    )
+
+    seg_rms = _scan_rms(audio, start_ms, end_ms)
+    if not seg_rms:
+        return end_ms
+    seg_peak = max(r for _, r in seg_rms)
+    tail_thresh = max(seg_peak * _TAIL_PEAK_FRACTION, tail_lenient)
+
+    last_audible = end_ms
+    consecutive_silent_ms = 0
+    pos = end_ms
+    while pos + _SCAN_WINDOW_MS <= extend_end:
+        rms = audio[pos : pos + _SCAN_WINDOW_MS].rms
+        if rms >= tail_thresh:
+            last_audible = pos + _SCAN_WINDOW_MS
+            consecutive_silent_ms = 0
+        else:
+            consecutive_silent_ms += _SCAN_STEP_MS
+            if consecutive_silent_ms >= _OFFSET_STOP_AFTER_SILENT_MS:
+                break
+        pos += _SCAN_STEP_MS
+    return last_audible
+
+
+def _merge_close_segments(
+    segments: list[tuple[int, int]],
+    audio: AudioSegment,
+    silence_thresh: int,
+) -> list[tuple[int, int]]:
+    """Merge consecutive segments separated by a quiet but non-silent gap.
+
+    Pydub splits a phrase whenever a quiet syllable (sustained "uhhh", soft
+    connecting vowel) drops below silence_thresh for ≥ min_silence_len. The
+    speaker hasn't actually stopped, so re-join segments whose gap is small
+    AND whose gap audio retains some energy above the room floor.
+    """
+    if not segments:
+        return segments
+    tail_lenient = (
+        db_to_float(silence_thresh + _TAIL_FLOOR_DB_OFFSET)
+        * audio.max_possible_amplitude
+    )
+    merge_floor = tail_lenient * _PHRASE_MERGE_FLOOR_FRACTION
+
+    merged = [segments[0]]
+    for start, end in segments[1:]:
+        prev_start, prev_end = merged[-1]
+        gap = start - prev_end
+        if gap <= 0:
+            merged[-1] = (prev_start, max(prev_end, end))
+            continue
+        if gap > _PHRASE_MERGE_GAP_MS:
+            merged.append((start, end))
+            continue
+        gap_rms = audio[prev_end:start].rms
+        if gap_rms >= merge_floor:
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def extract_audio(video_path: str, audio_path: str) -> None:
@@ -90,21 +193,28 @@ def detect_speaking_segments(
         return []
 
     duration_ms = len(audio)
-    padded = []
+    snapped: list[tuple[int, int]] = []
     for start, end in segments:
-        snapped = _snap_segment_start(audio, start, end, silence_thresh)
-        if end - snapped < _MIN_SEGMENT_MS:
+        new_start = _snap_segment_start(audio, start, end, silence_thresh)
+        new_end = _snap_segment_end(audio, new_start, end, silence_thresh)
+        if new_end - new_start < _MIN_SEGMENT_MS:
             continue
-        padded.append((
-            max(0, snapped - start_padding),
-            min(duration_ms, end + end_padding),
-        ))
+        snapped.append((new_start, new_end))
 
-    if not padded:
+    if not snapped:
         print("Warning: All segments collapsed below frame threshold after onset snap.")
         return []
 
-    # Merge overlapping segments
+    # Re-join phrases that pydub split on a quiet middle syllable
+    snapped = _merge_close_segments(snapped, audio, silence_thresh)
+
+    # Apply padding
+    padded = [
+        (max(0, s - start_padding), min(duration_ms, e + end_padding))
+        for s, e in snapped
+    ]
+
+    # Merge overlapping segments after padding
     merged = [padded[0]]
     for start, end in padded[1:]:
         if start <= merged[-1][1]:
@@ -129,6 +239,30 @@ def _get_video_encoder() -> list[str]:
     except Exception:
         pass
     return ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+
+
+def _probe_fps(video_path: str) -> float:
+    """Return source video frame rate as float (handles "30000/1001" form)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if "/" in out:
+        num, den = out.split("/")
+        return float(num) / float(den)
+    return float(out)
+
+
+def _quantize_to_frame(time_s: float, fps: float) -> float:
+    """Snap a requested time UP to the next video-frame boundary.
+
+    H.264 keyframes can only land on frame boundaries. Encoders snap forced
+    keyframes to the nearest frame (rounding up). To make our cuts land at
+    exactly where keyframes are placed, we quantize the request up-front so
+    requested time, encoded keyframe position, and cut seek point all match.
+    """
+    return math.ceil(time_s * fps) / fps
 
 
 def _normalize_video(
@@ -166,25 +300,36 @@ def build_trimmed_video(
     If keep_segments_dir is provided, numbered segment files (001.mp4, 002.mp4, ...)
     are saved there for individual download. Returns list of saved segment paths.
     """
+    fps = _probe_fps(video_path)
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Step 1: Normalize to H.264/AAC with keyframes forced at every segment
+        # Step 1: Quantize all cut boundaries to frame positions. H.264 KFs can
+        # only land on frame boundaries, so an un-quantized request gets snapped
+        # by the encoder — and then `-ss X -c copy` snaps backward to the
+        # previous KF, yielding 100-400ms of leading content. Quantizing up
+        # front makes requested time = encoded KF = cut seek point.
+        quantized = [
+            (_quantize_to_frame(s_ms / 1000, fps),
+             _quantize_to_frame(e_ms / 1000, fps))
+            for s_ms, e_ms in segments
+        ]
+
+        # Step 2: Normalize to H.264/AAC with keyframes forced at every cut
         # boundary so stream-copy cuts land frame-accurately.
         normalized = str(Path(tmpdir) / "normalized.mp4")
-        key_frame_times = [t for start_ms, end_ms in segments
-                           for t in (start_ms / 1000, end_ms / 1000)]
+        key_frame_times = [t for s, e in quantized for t in (s, e)]
         _normalize_video(video_path, normalized, key_frame_times=key_frame_times)
 
-        # Step 2: Cut each segment with stream copy (preserves exact A/V sync)
+        # Step 3: Cut each segment with stream copy (preserves exact A/V sync)
         seg_files = []
-        for i, (start_ms, end_ms) in enumerate(segments):
+        for i, (start_s, end_s) in enumerate(quantized):
             seg_file = str(Path(tmpdir) / f"seg_{i:04d}.mp4")
-            start_s = start_ms / 1000
-            duration_s = (end_ms - start_ms) / 1000
+            duration_s = max(0.001, end_s - start_s)
             subprocess.run(
                 ["ffmpeg", "-y",
-                 "-ss", f"{start_s:.3f}",
+                 "-ss", f"{start_s:.6f}",
                  "-i", normalized,
-                 "-t", f"{duration_s:.3f}",
+                 "-t", f"{duration_s:.6f}",
                  "-c", "copy",
                  "-avoid_negative_ts", "make_zero",
                  seg_file],
