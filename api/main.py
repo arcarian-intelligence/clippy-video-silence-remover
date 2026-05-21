@@ -30,10 +30,10 @@ MAX_UPLOAD_MB = 2000
 @app.post("/api/upload")
 async def upload_video(
     file: UploadFile = File(...),
-    threshold: int = Form(-40),
-    start_padding: int = Form(0),
-    end_padding: int = Form(0),
-    min_silence: int = Form(250),
+    threshold: int = Form(-50),
+    start_padding: int = Form(50),
+    end_padding: int = Form(50),
+    min_silence: int = Form(300),
 ):
     if not file.filename:
         raise HTTPException(400, "No file provided")
@@ -63,10 +63,10 @@ async def upload_video(
 @app.post("/api/upload-batch")
 async def upload_batch(
     files: List[UploadFile] = File(...),
-    threshold: int = Form(-40),
-    start_padding: int = Form(0),
-    end_padding: int = Form(0),
-    min_silence: int = Form(250),
+    threshold: int = Form(-50),
+    start_padding: int = Form(50),
+    end_padding: int = Form(50),
+    min_silence: int = Form(300),
     order: str = Form(""),
 ):
     if not files:
