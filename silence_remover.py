@@ -3,6 +3,7 @@
 
 import argparse
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -247,11 +248,14 @@ def _probe_fps(video_path: str) -> float:
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", video_path],
         capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    if "/" in out:
-        num, den = out.split("/")
+    ).stdout
+    # iPhone .MOV files can produce output like "60/1,\n\n\n" — split on
+    # both newlines and commas and take the first non-empty token.
+    token = next((t.strip() for t in re.split(r"[,\n]", out) if t.strip()), "")
+    if "/" in token:
+        num, den = token.split("/", 1)
         return float(num) / float(den)
-    return float(out)
+    return float(token)
 
 
 def _quantize_to_frame(time_s: float, fps: float) -> float:
