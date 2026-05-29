@@ -20,7 +20,6 @@ _SCAN_STEP_MS = 5
 _ONSET_SEARCH_MS = 300
 _OFFSET_SEARCH_MS = 400
 _ONSET_RISE_RATIO = 2.0
-_ONSET_FALLBACK_PEAK_FRACTION = 0.25
 _TAIL_PEAK_FRACTION = 0.10
 _TAIL_FLOOR_DB_OFFSET = -5
 _OFFSET_STOP_AFTER_SILENT_MS = 100
@@ -44,15 +43,24 @@ def _scan_rms(
 def _snap_segment_start(
     audio: AudioSegment, start_ms: int, end_ms: int, silence_thresh: int
 ) -> int:
-    """Find the true speech onset using rise detection.
+    """Find the true speech onset, snapping to the START of the energy climb.
 
     Pydub's detect_nonsilent can include 50-200ms of breath, lip clicks, or
     ambient noise before real speech — anything above silence_thresh counts as
-    non-silent in its 250ms window. Walk the first 300ms of the segment with
-    25ms windows and find the position where energy *jumps* (next window ≥ 2×
-    current). That signature distinguishes voiced speech onset from constant
-    pre-speech noise. Fallback to peak-fraction snap if no rise is found
-    (segment was already mid-speech).
+    non-silent in its 250ms window. Walk the first 300ms with 25ms windows and
+    find the FIRST clear energy jump (next window ≥ 2× current, landing above
+    the silence floor) — that jump is speech beginning. Then walk BACK over the
+    contiguous above-floor climb to its start, so soft voiced onsets (h/wh/f/s,
+    soft m/n/l/w/r, any quiet-to-loud ramp) are kept while only the sub-floor
+    breath/silence beneath them is dropped.
+
+    The earlier version snapped to the jump's *destination* (the top of the
+    biggest rise). For any word whose soft onset ran longer than the start
+    padding could recover, that clipped the first word/syllable — the loud
+    vowel nucleus is the biggest 2× jump, so the snap landed mid-word. When no
+    jump is found in the first 300ms the segment is already mid-speech (or the
+    onset is too gradual to localize); trust pydub's start rather than advance,
+    which would risk clipping the word.
     """
     search_end = min(start_ms + _ONSET_SEARCH_MS, end_ms)
     silence_floor = db_to_float(silence_thresh) * audio.max_possible_amplitude
@@ -63,26 +71,26 @@ def _snap_segment_start(
     peak = max(r for _, r in rms_seq)
     source_floor = max(silence_floor, peak * 0.05)
 
-    best_rise_pos: int | None = None
-    best_rise_score = 0.0
+    rise_idx: int | None = None
     for i in range(len(rms_seq) - 1):
         _, src_rms = rms_seq[i]
-        dst_pos, dst_rms = rms_seq[i + 1]
+        _, dst_rms = rms_seq[i + 1]
         if dst_rms < silence_floor:
             continue
-        ratio = dst_rms / max(src_rms, source_floor)
-        if ratio >= _ONSET_RISE_RATIO and ratio > best_rise_score:
-            best_rise_score = ratio
-            best_rise_pos = dst_pos
+        if dst_rms / max(src_rms, source_floor) >= _ONSET_RISE_RATIO:
+            rise_idx = i
+            break
 
-    if best_rise_pos is not None:
-        return best_rise_pos
+    if rise_idx is None:
+        return start_ms
 
-    onset_thresh = max(peak * _ONSET_FALLBACK_PEAK_FRACTION, silence_floor)
-    for pos, rms in rms_seq:
-        if rms >= onset_thresh:
-            return pos
-    return start_ms
+    # From the above-floor destination window, back up over the contiguous
+    # above-floor climb to its start.
+    j = rise_idx + 1
+    while j > 0 and rms_seq[j][1] >= silence_floor:
+        j -= 1
+    onset_idx = j + 1 if rms_seq[j][1] < silence_floor else j
+    return rms_seq[onset_idx][0]
 
 
 def _snap_segment_end(
