@@ -24,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_UPLOAD_MB = 2000
+MAX_UPLOAD_MB = 5000
 
 
 @app.post("/api/upload")
