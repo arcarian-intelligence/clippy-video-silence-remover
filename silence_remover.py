@@ -186,7 +186,7 @@ def detect_speaking_segments(
     audio_path: str,
     silence_thresh: int,
     min_silence_len: int = 300,
-    start_padding: int = 50,
+    start_padding: int = 30,
     end_padding: int = 50,
 ) -> list[tuple[int, int]]:
     """Detect non-silent segments in audio. Returns list of (start_ms, end_ms)."""
@@ -387,8 +387,8 @@ def main():
         help="Silence threshold in dB (default: -50)"
     )
     parser.add_argument(
-        "--start-padding", type=int, default=50,
-        help="Padding in ms kept before each speech segment (default: 50)"
+        "--start-padding", type=int, default=30,
+        help="Padding in ms kept before each speech segment (default: 30)"
     )
     parser.add_argument(
         "--end-padding", type=int, default=50,

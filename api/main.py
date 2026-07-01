@@ -31,7 +31,7 @@ MAX_UPLOAD_MB = 2000
 async def upload_video(
     file: UploadFile = File(...),
     threshold: int = Form(-50),
-    start_padding: int = Form(50),
+    start_padding: int = Form(30),
     end_padding: int = Form(50),
     min_silence: int = Form(300),
 ):
@@ -64,7 +64,7 @@ async def upload_video(
 async def upload_batch(
     files: List[UploadFile] = File(...),
     threshold: int = Form(-50),
-    start_padding: int = Form(50),
+    start_padding: int = Form(30),
     end_padding: int = Form(50),
     min_silence: int = Form(300),
     order: str = Form(""),
